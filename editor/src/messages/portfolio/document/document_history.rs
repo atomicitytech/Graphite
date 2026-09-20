@@ -97,16 +97,8 @@ impl DocumentHistory {
 	/// Stage the runtime snapshot into the `Gdd` working copy at each `CommitTransaction`. No-op while
 	/// unmounted. Proto-node declaration bytes go into `byte_store` (the app-global resource cache). The
 	/// staged hot ops are retired by [`retire_storage_interaction`](Self::retire_storage_interaction) at
-	/// undo-step boundaries. `validate` (the `validate_storage_round_trip` preference) gates the per-commit
-	/// round-trip check, off by default for its perf cost.
-	pub fn stage_snapshot(
-		&mut self,
-		interface: &NodeNetworkInterface,
-		registry: &ResourceRegistry,
-		view_settings: BTreeMap<String, serde_json::Value>,
-		legacy_document: &str,
-		byte_store: &dyn ResourceStorage,
-	) {
+	/// undo-step boundaries.
+	pub fn stage_snapshot(&mut self, interface: &NodeNetworkInterface, registry: &ResourceRegistry, view_settings: BTreeMap<String, serde_json::Value>, byte_store: &dyn ResourceStorage) {
 		let Some(storage) = self.storage.as_mut() else { return };
 
 		let network = interface.document_network();
@@ -132,12 +124,6 @@ impl DocumentHistory {
 			&& let Err(error) = storage.set_network_view_settings(network_view_settings)
 		{
 			log::error!("Persisting per-network view settings failed: {error}");
-		}
-
-		// Dual-write soak: embed the legacy `.graphite` bytes so the new format
-		// can be validated against (and recovered from) the old one on open.
-		if let Err(error) = storage.store_legacy_document(legacy_document.as_bytes()) {
-			log::error!("Embedding legacy document into working copy failed: {error}");
 		}
 	}
 
