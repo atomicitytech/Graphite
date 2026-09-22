@@ -309,16 +309,12 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 					responses.add(PortfolioMessage::SelectDocument { document_id });
 				}
 			}
-			PortfolioMessage::DocumentStorageMounted { document_id, reopened, mounted } => {
+			PortfolioMessage::DocumentStorageMounted { document_id, reopened, gdd } => {
 				let Some(document) = self.documents.get_mut(&document_id) else {
 					// Document was closed before its working copy finished mounting.
 					return;
 				};
-				let Some((gdd, declarations)) = mounted else {
-					log::error!("DocumentStorageMounted for {document_id:?} arrived without its payload");
-					return;
-				};
-				document.set_storage(gdd, declarations);
+				document.set_storage(gdd);
 				if !reopened {
 					document.commit_storage_snapshot(&resource_storage.resources_mut(), preferences.validate_storage_round_trip);
 					document.retire_storage_interaction();
@@ -550,6 +546,18 @@ impl MessageHandler<PortfolioMessage, PortfolioMessageContext<'_>> for Portfolio
 				// The working copy is already mounted (we opened the .gdd), so skip the async re-mount.
 				self.load_document(document, document_id, resource_storage, preferences.validate_storage_round_trip, responses);
 				responses.add(PortfolioMessage::SelectDocument { document_id });
+			}
+			PortfolioMessage::GddUndoRedoRebuilt { document_id, had_oracle, interface } => {
+				let Some(document) = self.documents.get_mut(&document_id) else {
+					// Document was closed before its undo/redo rebuild completed; drop the payload.
+					return;
+				};
+				let Some(interface) = interface.map(|boxed| *boxed) else {
+					// The rebuild failed and already logged; leave the live document untouched.
+					return;
+				};
+
+				document.apply_gdd_cursor_rebuild(interface, had_oracle, preferences.validate_storage_round_trip, responses);
 			}
 			PortfolioMessage::ToggleResetNodesToDefinitionsOnOpen => {
 				self.reset_node_definitions_on_open = !self.reset_node_definitions_on_open;
@@ -1310,16 +1318,14 @@ impl PortfolioMessageHandler {
 				}
 			};
 
-			let declarations = gdd.declarations(byte_store.as_ref()).await;
-
 			if validate && reopened {
-				compare_storage_against_runtime(&gdd, &legacy_network, &declarations, document_id);
+				compare_storage_against_runtime(&gdd, &legacy_network, byte_store.as_ref(), document_id).await;
 			}
 
 			Message::Portfolio(PortfolioMessage::DocumentStorageMounted {
 				document_id,
 				reopened,
-				mounted: Some((gdd, declarations)),
+				gdd: Some(gdd),
 			})
 		};
 		future.into()
