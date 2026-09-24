@@ -1,4 +1,4 @@
-use super::{InputConnector, OutputConnector, Previewing, RootNode, TransactionStatus};
+use super::{InputConnector, NodeNetworkInterface, NodeNetworkTemplate, NodeTemplate, NodeTemplateImplementation, OutputConnector, Previewing, RootNode, TransactionStatus};
 use crate::messages::portfolio::document::node_graph::utility_types::Direction;
 use crate::test_utils::test_prelude::*;
 use graph_craft::document::NodeInput;
@@ -446,4 +446,134 @@ async fn toggle_preview_transitions_with_a_connected_export() {
 	assert_eq!(network_interface.previewing(&[]), Previewing::No);
 
 	assert_invariants(&editor, "after cycling through the preview states");
+}
+
+fn assert_interface_invariants(network_interface: &NodeNetworkInterface, context: &str) {
+	let violations = network_interface.validate_invariants();
+	assert!(violations.is_empty(), "Invariant violations {context}:\n{}", violations.join("\n"));
+}
+
+fn value_input() -> NodeInput {
+	NodeInput::value(TaggedValue::None, false)
+}
+
+/// A source feeding a node that feeds a consumer, with the outward wire cache loaded so every later mutation has to keep it current.
+fn wired_interface() -> (NodeNetworkInterface, NodeId, NodeId, NodeId) {
+	let (source, node, consumer) = (NodeId(1), NodeId(2), NodeId(3));
+	let mut network_interface = NodeNetworkInterface::default();
+	network_interface.insert_node(
+		source,
+		NodeTemplate {
+			inputs: vec![value_input()],
+			..Default::default()
+		},
+		&[],
+	);
+	network_interface.insert_node(
+		node,
+		NodeTemplate {
+			inputs: vec![value_input(), value_input()],
+			..Default::default()
+		},
+		&[],
+	);
+	network_interface.insert_node(
+		consumer,
+		NodeTemplate {
+			inputs: vec![value_input()],
+			..Default::default()
+		},
+		&[],
+	);
+	network_interface.set_input(&InputConnector::node_at_index(node, 0), NodeInput::node(source, 0), &[]);
+	network_interface.set_input(&InputConnector::node_at_index(consumer, 0), NodeInput::node(node, 0), &[]);
+
+	assert!(network_interface.outward_wires(&[]).is_some());
+	assert_interface_invariants(&network_interface, "after wiring the fixture");
+	(network_interface, source, node, consumer)
+}
+
+#[test]
+fn replacing_inputs_keeps_the_loaded_wire_cache_exact() {
+	let (mut network_interface, source, node, _) = wired_interface();
+
+	let mut template = NodeTemplate {
+		inputs: vec![value_input(); 3],
+		..Default::default()
+	};
+	template.normalize_input_metadata();
+	network_interface.replace_inputs(&node, &[], &mut template);
+	assert_interface_invariants(&network_interface, "after replacing the inputs of a wired node");
+
+	// The wire returns at a new index, as a migration restores the inputs it keeps
+	network_interface.set_input(&InputConnector::node_at_index(node, 2), NodeInput::node(source, 0), &[]);
+	assert_interface_invariants(&network_interface, "after rewiring the source into the replaced node");
+}
+
+#[test]
+fn replacing_an_implementation_keeps_its_outputs_listed_in_the_wire_cache() {
+	let (mut network_interface, _, node, _) = wired_interface();
+	let second_output = OutputConnector::node(node, 1);
+
+	let two_exports = NodeNetworkTemplate {
+		exports: vec![value_input(), value_input()],
+		..Default::default()
+	};
+	let mut template = NodeTemplate {
+		implementation: NodeTemplateImplementation::Network(two_exports),
+		..Default::default()
+	};
+	network_interface.replace_implementation(&node, &[], &mut template);
+	assert!(
+		network_interface.outward_wires(&[]).is_some_and(|wires| wires.contains_key(&second_output)),
+		"a gained output should be listed"
+	);
+
+	network_interface.replace_implementation(&node, &[], &mut NodeTemplate::default());
+	assert!(
+		network_interface.outward_wires(&[]).is_some_and(|wires| !wires.contains_key(&second_output)),
+		"a lost output should be delisted"
+	);
+}
+
+#[test]
+fn inserting_and_deleting_nodes_keeps_the_loaded_wire_cache_exact() {
+	let (mut network_interface, _, node, _) = wired_interface();
+
+	network_interface.insert_node(NodeId(4), NodeTemplate::default(), &[]);
+	assert_interface_invariants(&network_interface, "after inserting a node while the cache is loaded");
+
+	network_interface.delete_nodes(vec![node], false, &[]);
+	assert_interface_invariants(&network_interface, "after deleting a wired node");
+}
+
+#[test]
+fn adding_an_import_ahead_of_a_wired_input_keeps_the_loaded_wire_cache_exact() {
+	let (source, node) = (NodeId(1), NodeId(2));
+	let mut network_interface = NodeNetworkInterface::default();
+	network_interface.insert_node(
+		source,
+		NodeTemplate {
+			inputs: vec![value_input()],
+			..Default::default()
+		},
+		&[],
+	);
+	let network = NodeNetworkTemplate {
+		exports: vec![value_input()],
+		..Default::default()
+	};
+	let template = NodeTemplate {
+		implementation: NodeTemplateImplementation::Network(network),
+		inputs: vec![value_input()],
+		output_names: vec![String::new()],
+		..Default::default()
+	};
+	network_interface.insert_node(node, template, &[]);
+	network_interface.set_input(&InputConnector::node_at_index(node, 0), NodeInput::node(source, 0), &[]);
+	assert!(network_interface.outward_wires(&[]).is_some());
+
+	// Inserting ahead of the wired input moves that wire to index 1
+	network_interface.add_import(TaggedValue::None, true, 0, "", "", &[node]);
+	assert_interface_invariants(&network_interface, "after adding an import ahead of a wired input");
 }

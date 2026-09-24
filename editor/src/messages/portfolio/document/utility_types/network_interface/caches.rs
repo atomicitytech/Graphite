@@ -447,7 +447,7 @@ impl NodeNetworkInterface {
 	}
 
 	/// Every input fed by each node output and each import of the network.
-	fn compute_outward_wires(&self, network_path: &[NodeId]) -> Option<HashMap<OutputConnector, Vec<InputConnector>>> {
+	pub(super) fn compute_outward_wires(&self, network_path: &[NodeId]) -> Option<HashMap<OutputConnector, Vec<InputConnector>>> {
 		let mut outward_wires = HashMap::new();
 		let Some(network) = self.nested_network(network_path) else {
 			log::error!("Could not get nested network in compute_outward_wires");
@@ -509,23 +509,36 @@ impl NodeNetworkInterface {
 	/// avoiding a full rebuild. If the cache is not loaded, this is a no-op (it will be fully
 	/// rebuilt on the next read via `outward_wires()`).
 	pub(crate) fn update_outward_wires(&mut self, network_path: &[NodeId], input_connector: &InputConnector, old_input: &NodeInput, new_input: &NodeInput) {
-		let Some(transient) = self.network_transient_mut(network_path) else {
-			return;
-		};
-		let Some(outward_wires) = transient.outward_wires.get_loaded_mut() else {
-			return;
-		};
+		let Some(transient) = self.network_transient_mut(network_path) else { return };
+		let Some(outward_wires) = transient.outward_wires.get_loaded_mut() else { return };
 
-		// Remove the input_connector from the old output's downstream list
-		if let Some(old_output) = OutputConnector::from_input(old_input)
-			&& let Some(connections) = outward_wires.get_mut(&old_output)
-		{
-			connections.retain(|c| c != input_connector);
+		unhook_outward_wire(outward_wires, input_connector, old_input);
+		hook_outward_wire(outward_wires, input_connector, new_input);
+	}
+
+	/// The same update for a node whose whole input list was swapped.
+	pub(crate) fn update_outward_wires_for_inputs(&mut self, network_path: &[NodeId], node_id: &NodeId, old_inputs: &[NodeInput], new_inputs: &[NodeInput]) {
+		let Some(transient) = self.network_transient_mut(network_path) else { return };
+		let Some(outward_wires) = transient.outward_wires.get_loaded_mut() else { return };
+
+		for (input_index, old_input) in old_inputs.iter().enumerate() {
+			unhook_outward_wire(outward_wires, &InputConnector::node_at_index(*node_id, input_index), old_input);
 		}
+		for (input_index, new_input) in new_inputs.iter().enumerate() {
+			hook_outward_wire(outward_wires, &InputConnector::node_at_index(*node_id, input_index), new_input);
+		}
+	}
 
-		// Add the input_connector to the new output's downstream list
-		if let Some(new_output) = OutputConnector::from_input(new_input) {
-			outward_wires.entry(new_output).or_default().push(*input_connector);
+	/// Lists or delists a node's outputs after their count changed, since every output is keyed even with no consumers.
+	pub(crate) fn update_outward_wires_for_outputs(&mut self, network_path: &[NodeId], node_id: &NodeId, old_output_count: usize, new_output_count: usize) {
+		let Some(transient) = self.network_transient_mut(network_path) else { return };
+		let Some(outward_wires) = transient.outward_wires.get_loaded_mut() else { return };
+
+		for output_index in new_output_count..old_output_count {
+			outward_wires.remove(&OutputConnector::node(*node_id, output_index));
+		}
+		for output_index in old_output_count..new_output_count {
+			outward_wires.entry(OutputConnector::node(*node_id, output_index)).or_default();
 		}
 	}
 
@@ -866,5 +879,21 @@ impl NodeNetworkInterface {
 		for upstream_id in &upstream_nodes {
 			self.unload_node_click_targets(upstream_id, network_path);
 		}
+	}
+}
+
+/// Drops `input_connector` from the consumers of the output that `input` was wired to.
+fn unhook_outward_wire(outward_wires: &mut HashMap<OutputConnector, Vec<InputConnector>>, input_connector: &InputConnector, input: &NodeInput) {
+	if let Some(output) = OutputConnector::from_input(input)
+		&& let Some(connections) = outward_wires.get_mut(&output)
+	{
+		connections.retain(|connection| connection != input_connector);
+	}
+}
+
+/// Adds `input_connector` to the consumers of the output that `input` is wired to.
+fn hook_outward_wire(outward_wires: &mut HashMap<OutputConnector, Vec<InputConnector>>, input_connector: &InputConnector, input: &NodeInput) {
+	if let Some(output) = OutputConnector::from_input(input) {
+		outward_wires.entry(output).or_default().push(*input_connector);
 	}
 }
