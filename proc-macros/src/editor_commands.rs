@@ -74,17 +74,35 @@ pub fn editor_commands_impl(attr: TokenStream, module: ItemMod) -> syn::Result<T
 		let return_type = &signature.output;
 		let body = &function.block;
 
+		// Remote-control fork: command bodies may return `Result<Message, String>` instead of `Message` when they
+		// validate their inputs (remote payloads deserialize successfully but can still violate invariants — see the
+		// `TryFrom` emission below). A body is fallible iff its declared return type's outermost path is `Result`.
+		let fallible = matches!(&signature.output, syn::ReturnType::Type(_, ty)
+			if matches!(&**ty, syn::Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "Result")));
+
 		let span = fn_name.span();
 		variants.extend(quote_spanned! {span=>
 			#(#docs)*
 			#variant { #(#param_names: #param_types,)* },
 		});
+		// Web stubs run the body in-process: infallible bodies dispatch directly, fallible ones dispatch on `Ok` and
+		// log-and-drop on `Err` (so a bad payload can never panic the editor, from JS or from the remote path)
+		let web_stub_body = if fallible {
+			quote_spanned! {span=>
+				match (move || #return_type #body)() {
+					Ok(message) => self.dispatch(message),
+					Err(error) => log::error!(concat!("Rejected invalid ", stringify!(#js_name), " command: {}"), error),
+				}
+			}
+		} else {
+			quote_spanned! {span=> self.dispatch((move || #return_type #body)()) }
+		};
 		stubs.extend(quote_spanned! {span=>
 			#(#docs)*
 			#[cfg(not(feature = "native"))]
 			#[wasm_bindgen(js_name = #js_name)]
 			pub fn #fn_name(&self, #(#param_names: #param_types,)*) {
-				self.dispatch((move || #return_type #body)())
+				#web_stub_body
 			}
 			#(#docs)*
 			#[cfg(feature = "native")]
@@ -93,8 +111,15 @@ pub fn editor_commands_impl(attr: TokenStream, module: ItemMod) -> syn::Result<T
 				self.send(EditorCommand::#variant { #(#param_names,)* })
 			}
 		});
+		// Conversion arms produce `Result<Message, String>`: fallible bodies already do, infallible ones are wrapped.
+		// Bodies run inside a closure so their early `return`s keep targeting the command body, not `try_from`
+		let arm_body = if fallible {
+			quote_spanned! {span=> (move || #return_type #body)() }
+		} else {
+			quote_spanned! {span=> Ok((move || #return_type #body)()) }
+		};
 		arms.extend(quote_spanned! {span=>
-			EditorCommand::#variant { #(#param_names,)* } => #body,
+			EditorCommand::#variant { #(#param_names,)* } => #arm_body,
 		});
 	}
 
@@ -104,15 +129,24 @@ pub fn editor_commands_impl(attr: TokenStream, module: ItemMod) -> syn::Result<T
 			#imports
 		)*
 
-		#[cfg(any(feature = "native", not(target_family = "wasm")))]
+		// Remote-control fork: both cfg gates below originally excluded the plain web/wasm build
+		// (`any(feature = "native", not(target_family = "wasm"))`); they are widened so the enum and its
+		// conversion also exist on wasm, where the relay client deserializes remote payloads into commands.
 		#[derive(serde::Serialize, serde::Deserialize)]
 		pub enum EditorCommand {
 			#variants
 		}
 
-		#[cfg(all(feature = "editor", any(feature = "native", not(target_family = "wasm"))))]
-		impl From<EditorCommand> for Message {
-			fn from(command: EditorCommand) -> Self {
+		// Remote-control fork: emitted as `TryFrom` (upstream emits `From`) because remote payloads are untrusted —
+		// they can deserialize successfully yet violate invariants the JS path upholds by construction (undefined
+		// modifier-key bits, wrong widget value shapes, out-of-range node ids). Command bodies that validate return
+		// `Result<Message, String>`; the rest are wrapped in `Ok` above.
+		#[cfg(feature = "editor")]
+		impl TryFrom<EditorCommand> for Message {
+			type Error = String;
+			// Command bodies run inside immediately-invoked closures to preserve their early-`return` semantics
+			#[allow(clippy::redundant_closure_call)]
+			fn try_from(command: EditorCommand) -> Result<Self, Self::Error> {
 				match command {
 					#arms
 				}

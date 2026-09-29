@@ -8,9 +8,12 @@ pub mod editor_commands;
 pub mod editor_wrapper;
 pub mod helpers;
 pub mod native_communication;
+#[cfg(all(not(feature = "native"), target_family = "wasm"))]
+mod remote_communication;
 mod wasm_value;
 
-#[cfg(any(feature = "native", not(target_family = "wasm")))]
+// Remote-control fork: cfg gate removed (upstream: `any(feature = "native", not(target_family = "wasm"))`)
+// because the relay client needs `EditorCommand` on the plain web/wasm build too
 pub use editor_commands::EditorCommand;
 
 #[cfg(feature = "editor")]

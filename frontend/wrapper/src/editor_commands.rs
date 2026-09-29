@@ -118,46 +118,46 @@ mod editor_commands {
 	}
 
 	/// Update the value of a given UI widget, but don't commit it to the history (unless `commit_layout()` is called, which handles that)
-	fn widget_value_update(layout_target: LayoutTarget, widget_id: u64, value: Any, resend_widget: bool) -> Message {
+	fn widget_value_update(layout_target: LayoutTarget, widget_id: u64, value: Any, resend_widget: bool) -> Result<Message, String> {
 		let widget_id = WidgetId(widget_id);
 		let update = LayoutMessage::WidgetValueUpdate {
 			layout_target,
 			widget_id,
-			value: value.cast(),
+			value: value.cast()?,
 		};
-		if resend_widget {
+		Ok(if resend_widget {
 			Message::Batched {
 				messages: Box::new([update.into(), LayoutMessage::ResendActiveWidget { layout_target, widget_id }.into()]),
 			}
 		} else {
 			update.into()
-		}
+		})
 	}
 
 	/// Commit the value of a given UI widget to the history
-	fn widget_value_commit(layout_target: LayoutTarget, widget_id: u64, value: Any) -> Message {
-		LayoutMessage::WidgetValueCommit {
+	fn widget_value_commit(layout_target: LayoutTarget, widget_id: u64, value: Any) -> Result<Message, String> {
+		Ok(LayoutMessage::WidgetValueCommit {
 			layout_target,
 			widget_id: WidgetId(widget_id),
-			value: value.cast(),
+			value: value.cast()?,
 		}
-		.into()
+		.into())
 	}
 
 	/// Update the value of a given UI widget, and commit it to the history
-	fn widget_value_commit_and_update(layout_target: LayoutTarget, widget_id: u64, value: Any, resend_widget: bool) -> Message {
+	fn widget_value_commit_and_update(layout_target: LayoutTarget, widget_id: u64, value: Any, resend_widget: bool) -> Result<Message, String> {
 		let widget_id = WidgetId(widget_id);
 		let mut messages: Vec<Message> = vec![
 			LayoutMessage::WidgetValueCommit {
 				layout_target,
 				widget_id,
-				value: value.cast(),
+				value: value.cast()?,
 			}
 			.into(),
 			LayoutMessage::WidgetValueUpdate {
 				layout_target,
 				widget_id,
-				value: value.cast(),
+				value: value.cast()?,
 			}
 			.into(),
 		];
@@ -167,7 +167,7 @@ mod editor_commands {
 		// Close out a transaction that the widget's `on_commit` opened (if any), so a single click on widgets like the
 		// NumberInput's increment buttons collapses into one history step instead of leaving the transaction in `Modified`
 		messages.push(DocumentMessage::EndTransaction.into());
-		Message::Batched { messages: messages.into() }
+		Ok(Message::Batched { messages: messages.into() })
 	}
 
 	/// Fire a widget's drag-drop action (e.g. when a draggable item is dropped on a button)
@@ -306,7 +306,7 @@ mod editor_commands {
 		twist: Option<f64>,
 		tangential: Option<f64>,
 		eraser: bool,
-	) -> Message {
+	) -> Result<Message, String> {
 		let editor_mouse_state = EditorPointerState {
 			time,
 			pressure,
@@ -319,16 +319,16 @@ mod editor_commands {
 			eraser,
 			..EditorPointerState::from_keys_and_editor_position(mouse_keys, (x, y).into())
 		};
-		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
-		InputPreprocessorMessage::PointerMove { editor_mouse_state, modifier_keys }.into()
+		let modifier_keys = ModifierKeys::from_bits(modifiers).ok_or("undefined modifier key bits")?;
+		Ok(InputPreprocessorMessage::PointerMove { editor_mouse_state, modifier_keys }.into())
 	}
 
 	/// Mouse scrolling within the screenspace bounds of the viewport
-	fn on_wheel_scroll(x: f64, y: f64, mouse_keys: u8, wheel_delta_x: f64, wheel_delta_y: f64, wheel_delta_z: f64, modifiers: u8) -> Message {
+	fn on_wheel_scroll(x: f64, y: f64, mouse_keys: u8, wheel_delta_x: f64, wheel_delta_y: f64, wheel_delta_z: f64, modifiers: u8) -> Result<Message, String> {
 		let mut editor_mouse_state = EditorPointerState::from_keys_and_editor_position(mouse_keys, (x, y).into());
 		editor_mouse_state.scroll_delta = ScrollDelta::new(wheel_delta_x, wheel_delta_y, wheel_delta_z);
-		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
-		InputPreprocessorMessage::WheelScroll { editor_mouse_state, modifier_keys }.into()
+		let modifier_keys = ModifierKeys::from_bits(modifiers).ok_or("undefined modifier key bits")?;
+		Ok(InputPreprocessorMessage::WheelScroll { editor_mouse_state, modifier_keys }.into())
 	}
 
 	/// A mouse button depressed within screenspace the bounds of the viewport
@@ -344,7 +344,7 @@ mod editor_commands {
 		twist: Option<f64>,
 		tangential: Option<f64>,
 		eraser: bool,
-	) -> Message {
+	) -> Result<Message, String> {
 		let editor_mouse_state = EditorPointerState {
 			time,
 			pressure,
@@ -357,8 +357,8 @@ mod editor_commands {
 			eraser,
 			..EditorPointerState::from_keys_and_editor_position(mouse_keys, (x, y).into())
 		};
-		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
-		InputPreprocessorMessage::PointerDown { editor_mouse_state, modifier_keys }.into()
+		let modifier_keys = ModifierKeys::from_bits(modifiers).ok_or("undefined modifier key bits")?;
+		Ok(InputPreprocessorMessage::PointerDown { editor_mouse_state, modifier_keys }.into())
 	}
 
 	/// A mouse button released
@@ -374,7 +374,7 @@ mod editor_commands {
 		twist: Option<f64>,
 		tangential: Option<f64>,
 		eraser: bool,
-	) -> Message {
+	) -> Result<Message, String> {
 		let editor_mouse_state = EditorPointerState {
 			time,
 			pressure,
@@ -387,38 +387,38 @@ mod editor_commands {
 			eraser,
 			..EditorPointerState::from_keys_and_editor_position(mouse_keys, (x, y).into())
 		};
-		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
-		InputPreprocessorMessage::PointerUp { editor_mouse_state, modifier_keys }.into()
+		let modifier_keys = ModifierKeys::from_bits(modifiers).ok_or("undefined modifier key bits")?;
+		Ok(InputPreprocessorMessage::PointerUp { editor_mouse_state, modifier_keys }.into())
 	}
 
 	/// Mouse shaken
-	fn on_mouse_shake(x: f64, y: f64, mouse_keys: u8, modifiers: u8) -> Message {
+	fn on_mouse_shake(x: f64, y: f64, mouse_keys: u8, modifiers: u8) -> Result<Message, String> {
 		let editor_mouse_state = EditorPointerState::from_keys_and_editor_position(mouse_keys, (x, y).into());
-		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
-		InputPreprocessorMessage::PointerShake { editor_mouse_state, modifier_keys }.into()
+		let modifier_keys = ModifierKeys::from_bits(modifiers).ok_or("undefined modifier key bits")?;
+		Ok(InputPreprocessorMessage::PointerShake { editor_mouse_state, modifier_keys }.into())
 	}
 
 	/// Mouse double clicked
-	fn on_double_click(x: f64, y: f64, mouse_keys: u8, modifiers: u8) -> Message {
+	fn on_double_click(x: f64, y: f64, mouse_keys: u8, modifiers: u8) -> Result<Message, String> {
 		let editor_mouse_state = EditorPointerState::from_keys_and_editor_position(mouse_keys, (x, y).into());
-		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
-		InputPreprocessorMessage::DoubleClick { editor_mouse_state, modifier_keys }.into()
+		let modifier_keys = ModifierKeys::from_bits(modifiers).ok_or("undefined modifier key bits")?;
+		Ok(InputPreprocessorMessage::DoubleClick { editor_mouse_state, modifier_keys }.into())
 	}
 
 	/// A keyboard button depressed within screenspace the bounds of the viewport
-	fn on_key_down(name: String, modifiers: u8, key_repeat: bool) -> Message {
+	fn on_key_down(name: String, modifiers: u8, key_repeat: bool) -> Result<Message, String> {
 		let key = translate_key(&name);
-		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
+		let modifier_keys = ModifierKeys::from_bits(modifiers).ok_or("undefined modifier key bits")?;
 		trace!("Key down {key:?}, name: {name}, modifiers: {modifiers:?}, key repeat: {key_repeat}");
-		InputPreprocessorMessage::KeyDown { key, key_repeat, modifier_keys }.into()
+		Ok(InputPreprocessorMessage::KeyDown { key, key_repeat, modifier_keys }.into())
 	}
 
 	/// A keyboard button released
-	fn on_key_up(name: String, modifiers: u8, key_repeat: bool) -> Message {
+	fn on_key_up(name: String, modifiers: u8, key_repeat: bool) -> Result<Message, String> {
 		let key = translate_key(&name);
-		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
+		let modifier_keys = ModifierKeys::from_bits(modifiers).ok_or("undefined modifier key bits")?;
 		trace!("Key up {key:?}, name: {name}, modifiers: {modifier_keys:?}, key repeat: {key_repeat}");
-		InputPreprocessorMessage::KeyUp { key, key_repeat, modifier_keys }.into()
+		Ok(InputPreprocessorMessage::KeyUp { key, key_repeat, modifier_keys }.into())
 	}
 
 	/// A text box was committed
@@ -507,15 +507,18 @@ mod editor_commands {
 	/// Move a layer to within a folder and placed down at the given index.
 	/// If the folder is `None`, it is inserted into the document root.
 	/// If the insert index is `None`, it is inserted at the start of the folder.
-	fn move_layer_in_tree(insert_parent_id: Option<u64>, insert_index: Option<usize>) -> Message {
-		let insert_parent_id = insert_parent_id.map(NodeId);
-		let parent = insert_parent_id.map(LayerNodeIdentifier::new_unchecked).unwrap_or_default();
+	fn move_layer_in_tree(insert_parent_id: Option<u64>, insert_index: Option<usize>) -> Result<Message, String> {
+		// Remote-control fork: `new_unchecked` computes `NonZeroU64::new_unchecked(id + 1)`, so u64::MAX is UB in release builds
+		let parent = insert_parent_id
+			.map(|id| if id == u64::MAX { Err("layer id out of range") } else { Ok(LayerNodeIdentifier::new_unchecked(NodeId(id))) })
+			.transpose()?
+			.unwrap_or_default();
 
-		DocumentMessage::MoveSelectedLayersTo {
+		Ok(DocumentMessage::MoveSelectedLayersTo {
 			parent,
 			insert_index: insert_index.unwrap_or_default(),
 		}
-		.into()
+		.into())
 	}
 
 	/// Reorder a draggable Properties panel section to the given index among its peers.
@@ -530,24 +533,34 @@ mod editor_commands {
 	/// Duplicate the selected layers, placing the copies within the given folder at the given index.
 	/// If the folder is `None`, they are inserted into the document root.
 	/// If the insert index is `None`, they are inserted at the start of the folder.
-	fn duplicate_layer_in_tree(insert_parent_id: Option<u64>, insert_index: Option<usize>) -> Message {
-		DocumentMessage::DuplicateSelectedLayersTo {
-			parent: insert_parent_id.map(NodeId).map(LayerNodeIdentifier::new_unchecked).unwrap_or_default(),
+	fn duplicate_layer_in_tree(insert_parent_id: Option<u64>, insert_index: Option<usize>) -> Result<Message, String> {
+		// Remote-control fork: `new_unchecked` computes `NonZeroU64::new_unchecked(id + 1)`, so u64::MAX is UB in release builds
+		let parent = insert_parent_id
+			.map(|id| if id == u64::MAX { Err("layer id out of range") } else { Ok(LayerNodeIdentifier::new_unchecked(NodeId(id))) })
+			.transpose()?
+			.unwrap_or_default();
+
+		Ok(DocumentMessage::DuplicateSelectedLayersTo {
+			parent,
 			insert_index: insert_index.unwrap_or_default(),
 		}
-		.into()
+		.into())
 	}
 
 	/// Set the name for the layer
-	fn set_layer_name(id: u64, name: String) -> Message {
+	fn set_layer_name(id: u64, name: String) -> Result<Message, String> {
+		// Remote-control fork: `new_unchecked` computes `NonZeroU64::new_unchecked(id + 1)`, so u64::MAX is UB in release builds
+		if id == u64::MAX {
+			return Err("layer id out of range".to_string());
+		}
 		let layer = LayerNodeIdentifier::new_unchecked(NodeId(id));
-		NodeGraphMessage::SetDisplayName {
+		Ok(NodeGraphMessage::SetDisplayName {
 			node_id: layer.to_node(),
 			network_path: Vec::new(),
 			alias: name,
 			skip_adding_history_step: false,
 		}
-		.into()
+		.into())
 	}
 
 	/// Translates document (in viewport coords)
@@ -613,8 +626,10 @@ mod editor_commands {
 	}
 
 	/// A file dropped on a panel or pasted, placed by the drop position or the layer slot it landed in
-	fn ingest_file(name: Option<String>, mime_type: String, data: Vec<u8>, mouse_x: Option<f64>, mouse_y: Option<f64>, insert_parent_id: Option<u64>, insert_index: Option<u32>) -> Message {
+	fn ingest_file(name: Option<String>, mime_type: String, data: Vec<u8>, mouse_x: Option<f64>, mouse_y: Option<f64>, insert_parent_id: Option<u64>, insert_index: Option<u32>) -> Result<Message, String> {
 		let action = match (insert_parent_id.zip(insert_index), mouse_x.zip(mouse_y)) {
+			// Remote-control fork: `new_unchecked` computes `NonZeroU64::new_unchecked(id + 1)`, so u64::MAX is UB in release builds
+			(Some((parent, _)), _) if parent == u64::MAX => return Err("layer id out of range".to_string()),
 			(Some((parent, insert_index)), _) => IngestAction::DropOnLayers {
 				parent: LayerNodeIdentifier::new_unchecked(NodeId(parent)),
 				insert_index,
@@ -622,13 +637,13 @@ mod editor_commands {
 			(None, Some(mouse)) => IngestAction::DropOnCanvas { mouse },
 			(None, None) => IngestAction::Paste,
 		};
-		IngestMessage::Ingest {
+		Ok(IngestMessage::Ingest {
 			data,
 			action,
 			mime_type,
 			path: name.map(PathBuf::from),
 		}
-		.into()
+		.into())
 	}
 
 	/// Paste from a serialized JSON representation
@@ -722,9 +737,10 @@ pub type FillChoiceSRGBA8 = Any;
 #[tsify(from_wasm_abi)]
 pub struct Any(#[tsify(type = "any")] serde_json::Value);
 impl Any {
+	// Remote-control fork: fallible (upstream unwraps) because remote payloads can carry any value shape
 	#[cfg(feature = "editor")]
-	pub(crate) fn cast<T: for<'de> Deserialize<'de>>(&self) -> T {
-		serde_json::from_value(self.0.clone()).unwrap()
+	pub(crate) fn cast<T: for<'de> Deserialize<'de>>(&self) -> Result<T, String> {
+		serde_json::from_value(self.0.clone()).map_err(|error| format!("invalid widget value shape: {error}"))
 	}
 }
 

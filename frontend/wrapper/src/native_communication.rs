@@ -64,7 +64,14 @@ pub fn encode_frontend_messages(messages: Vec<editor::messages::prelude::Fronten
 #[cfg(all(feature = "editor", any(feature = "native", not(target_family = "wasm"))))]
 pub fn decode_editor_command(data: &[u8]) -> Option<editor::messages::prelude::Message> {
 	match serde_json::from_slice::<crate::EditorCommand>(data) {
-		Ok(command) => Some(command.into()),
+		// Remote-control fork: the conversion is `TryFrom` (upstream: `From`) — see the `editor_commands` proc macro
+		Ok(command) => match editor::messages::prelude::Message::try_from(command) {
+			Ok(message) => Some(message),
+			Err(e) => {
+				log::error!("Rejected invalid editor command: {e}");
+				None
+			}
+		},
 		Err(e) => {
 			log::error!("Failed to deserialize editor command: {e}");
 			None

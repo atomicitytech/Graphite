@@ -127,6 +127,10 @@ impl EditorWrapper {
 			return;
 		}
 
+		// Remote-control fork: outbound tee hook; the allowlist, serialization, and socket send all live on the fork-owned side
+		#[cfg(all(not(feature = "native"), target_family = "wasm"))]
+		crate::remote_communication::tee_frontend_message(&message);
+
 		let message_type = message.to_discriminant().local_name();
 
 		let serializer = serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true);
@@ -176,6 +180,9 @@ impl EditorWrapper {
 
 		#[cfg(target_family = "wasm")]
 		self.init_portfolio();
+
+		#[cfg(all(not(feature = "native"), target_family = "wasm"))]
+		crate::remote_communication::init_remote_communication();
 
 		// Poll node graph evaluation on `requestAnimationFrame`
 		{
