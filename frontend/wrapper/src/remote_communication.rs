@@ -1,10 +1,9 @@
 //! Fork-owned relay client for the remote-control feature (web build only).
 //!
 //! Connects the running editor to the relay server as a WebSocket client, per the wire format in
-//! the host repo's `design-spec/remote-control/wire-format.md`. This module owns all remote-control
-//! logic; the only integration points with upstream code are one init hook call in
-//! `init_after_frontend_ready` and (in a later phase) one outbound tee hook in
-//! `send_frontend_message_to_js`.
+//! the host repo's `design-spec/remote-control/wire-format.md`. This module and `remote_protocol` own
+//! all remote-control logic; the only integration points with upstream code are one init hook call in
+//! `init_after_frontend_ready` and one outbound tee hook in `send_frontend_message_to_js`.
 //!
 //! Configuration (checked at init, highest precedence first):
 //!
@@ -19,27 +18,23 @@
 //! A duplicated tab inherits the original's `sessionStorage` and so its UUID; the relay then kicks the
 //! older socket with the "replaced" close code, and the kicked tab stays disconnected until reloaded.
 //!
-//! This module carries the full relay client: connection lifecycle (hello, capped-exponential-backoff
-//! reconnect); inbound command dispatch through the fallible `TryFrom` validation boundary, with
-//! rejections broadcast back as `RemoteError` frames; the outbound allowlist tee (a compile-time-
-//! exhaustive match — see `tee_frontend_message`); the flush-on-socket-receipt message pump that keeps
-//! the editor responsive to remote traffic while the tab is hidden and `requestAnimationFrame` is
-//! suspended; and the `resend_state` pseudo-command.
+//! This module carries the browser side of the relay client: connection lifecycle (hello, capped-exponential-
+//! backoff reconnect); inbound frames handed to `remote_protocol` for validation, with rejections broadcast back
+//! as `RemoteError` frames and accepted commands dispatched unless the editor has crashed; the outbound tee into
+//! `remote_protocol`'s allowlist (see `tee_frontend_message`); and the flush-on-socket-receipt message pump that
+//! keeps the editor responsive to remote traffic while the tab is hidden and `requestAnimationFrame` is suspended.
+//! Frame building, validation, and the allowlist live in the platform-neutral `remote_protocol`, shared with the
+//! desktop client.
 
-use editor::messages::prelude::{DocumentMessage, FrontendMessage, Message, NodeGraphMessage, PortfolioMessage};
-use editor::utility_traits::{AsMessage, ToDiscriminant};
+use crate::remote_protocol::{self, Inbound};
+use editor::messages::prelude::{FrontendMessage, Message};
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
 use web_sys::{CloseEvent, MessageEvent, WebSocket};
 
-const PROTOCOL_VERSION: u64 = 1;
 const STORAGE_KEY_RELAY_URL: &str = "graphite-remote-relay-url";
 const STORAGE_KEY_PASSWORD: &str = "graphite-remote-password";
 const STORAGE_KEY_UUID: &str = "graphite-remote-uuid";
-/// Relay close code for a socket kicked by a newer connection claiming the same UUID (wire format, "Close codes").
-const CLOSE_CODE_REPLACED: u16 = 4001;
-const RECONNECT_BASE_MS: u32 = 500;
-const RECONNECT_CAP_MS: u32 = 30_000;
 
 #[derive(Clone)]
 struct RemoteConfig {
@@ -128,13 +123,8 @@ fn connect(config: &RemoteConfig) {
 	let open_socket = socket.clone();
 	let on_open = Closure::<dyn FnMut()>::new(move || {
 		RECONNECT_ATTEMPT.with(|attempt| attempt.set(0));
-		let hello = serde_json::json!({
-			"v": PROTOCOL_VERSION,
-			"role": "graphite",
-			"uuid": hello_config.uuid,
-			"password": hello_config.password,
-		});
-		if let Err(error) = open_socket.send_with_str(&hello.to_string()) {
+		let hello = remote_protocol::hello(&hello_config.uuid, &hello_config.password);
+		if let Err(error) = open_socket.send_with_str(&hello) {
 			log::warn!("Remote control: failed to send hello frame: {error:?}");
 		} else {
 			log::info!("Remote control: connected to relay and sent hello");
@@ -156,7 +146,7 @@ fn connect(config: &RemoteConfig) {
 	let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
 		SOCKET.with_borrow_mut(|slot| *slot = None);
 		// Reconnecting after being replaced would kick the newer holder of this UUID, which would reconnect and kick back
-		if event.code() == CLOSE_CODE_REPLACED {
+		if event.code() == remote_protocol::CLOSE_CODE_REPLACED {
 			log::warn!("Remote control: replaced by a newer connection with the same instance ID (likely a duplicated tab); not reconnecting until reload");
 			return;
 		}
@@ -183,7 +173,7 @@ fn schedule_reconnect() {
 		attempt.set(current.saturating_add(1));
 		current
 	});
-	let delay_ms = RECONNECT_BASE_MS.saturating_mul(1 << attempt.min(6)).min(RECONNECT_CAP_MS);
+	let delay_ms = remote_protocol::reconnect_delay(attempt).as_millis() as i32;
 
 	let closure = Closure::<dyn FnMut()>::new(move || {
 		let config = CONFIG.with_borrow(|config| config.clone());
@@ -192,79 +182,35 @@ fn schedule_reconnect() {
 		}
 	});
 
-	let scheduled = web_sys::window().map(|window| window.set_timeout_with_callback_and_timeout_and_arguments_0(closure.as_ref().unchecked_ref(), delay_ms as i32));
+	let scheduled = web_sys::window().map(|window| window.set_timeout_with_callback_and_timeout_and_arguments_0(closure.as_ref().unchecked_ref(), delay_ms));
 	match scheduled {
 		Some(Ok(_)) => RECONNECT_TIMER_CLOSURE.with_borrow_mut(|slot| *slot = Some(closure)),
 		_ => log::warn!("Remote control: failed to schedule reconnect"),
 	}
 }
 
-/// The payload shape delivered to a Graphite instance: the consumer envelope minus routing fields.
-#[derive(serde::Deserialize)]
-struct InboundPayload {
-	v: u64,
-	command: String,
-	args: Option<serde_json::Value>,
-	request_id: Option<String>,
-}
-
 fn handle_inbound_frame(text: &str) {
-	// Parsed in two steps so a rejected payload can still echo its `request_id` in the error frame
-	let value: serde_json::Value = match serde_json::from_str(text) {
-		Ok(value) => value,
-		Err(error) => {
-			log::warn!("Remote control: rejecting non-JSON inbound frame: {error}");
-			send_remote_error("bad_payload", &format!("payload is not valid JSON: {error}"), None);
-			return;
-		}
-	};
-	let request_id = value.get("request_id").and_then(|id| id.as_str()).map(str::to_string);
-
-	let payload: InboundPayload = match serde_json::from_value(value) {
-		Ok(payload) => payload,
-		Err(error) => {
-			log::warn!("Remote control: rejecting malformed inbound payload: {error}");
-			send_remote_error("bad_payload", &format!("payload must be an object with integer `v` and string `command`: {error}"), request_id.as_deref());
-			return;
-		}
-	};
-
-	if payload.v != PROTOCOL_VERSION {
-		log::warn!("Remote control: rejecting frame with unsupported protocol version {}", payload.v);
-		send_remote_error("bad_version", &format!("unsupported protocol version {}", payload.v), request_id.as_deref());
+	let Some(uuid) = CONFIG.with_borrow(|config| config.as_ref().map(|config| config.uuid.clone())) else {
 		return;
-	}
+	};
 
-	if payload.command == "resend_state" {
-		handle_resend_state(payload.request_id.as_deref());
-	} else {
-		dispatch_remote_command(payload);
+	match remote_protocol::handle_inbound(text, &uuid) {
+		Inbound::Reply(frame) => send_if_open(&frame, "RemoteError frame"),
+		Inbound::Dispatch { request_id, .. } if crate::EDITOR_HAS_CRASHED.load(std::sync::atomic::Ordering::SeqCst) => {
+			let frame = remote_protocol::remote_error("invalid_command", "editor has crashed; commands are no longer accepted", request_id.as_deref(), &uuid);
+			send_if_open(&frame, "RemoteError frame");
+		}
+		Inbound::Dispatch { messages, .. } => {
+			// Each dispatched separately, in order, as distinct top-level messages
+			for message in messages {
+				crate::helpers::wrapper(move |wrapper| wrapper.dispatch(message));
+			}
+		}
 	}
 
 	// Flush-on-socket-receipt: rAF (which normally pumps the editor) is suspended in hidden tabs,
 	// so every inbound frame drives a pump pass to keep remote traffic flowing regardless
 	spawn_message_pump();
-}
-
-/// The `resend_state` pseudo-command: re-emit the observable baseline for late-joining consumers.
-///
-/// The document list re-emits unconditionally. The layer observables cannot: `UpdateDocumentLayerDetails`
-/// and `UpdateDocumentLayerStructure` are built by editor-core paths that early-return unless the layers
-/// panel is open (`update_layer_panel`, `DocumentStructureChanged`), and `UpdateActiveDocument` has no
-/// re-emitting message at all. Making those unconditional would require editor-core changes (a new touch
-/// point), deliberately not taken; consumers get the panel-gated best effort.
-fn handle_resend_state(request_id: Option<&str>) {
-	if crate::EDITOR_HAS_CRASHED.load(std::sync::atomic::Ordering::SeqCst) {
-		send_remote_error("invalid_command", "editor has crashed; commands are no longer accepted", request_id);
-		return;
-	}
-
-	crate::helpers::wrapper(|wrapper| {
-		wrapper.dispatch(PortfolioMessage::UpdateOpenDocumentsList);
-		// Details before structure, since structure entries only make sense against received details
-		wrapper.dispatch(NodeGraphMessage::UpdateLayerPanel);
-		wrapper.dispatch(DocumentMessage::DocumentStructureChanged);
-	});
 }
 
 const PUMP_MAX_ROUNDS: usize = 32;
@@ -325,237 +271,22 @@ fn take_frame_deferred_messages() -> Vec<Message> {
 	})
 }
 
-fn dispatch_remote_command(payload: InboundPayload) {
-	if crate::EDITOR_HAS_CRASHED.load(std::sync::atomic::Ordering::SeqCst) {
-		send_remote_error("invalid_command", "editor has crashed; commands are no longer accepted", payload.request_id.as_deref());
-		return;
-	}
-
-	// Reassemble serde's externally-tagged enum encoding, `{"CommandName": {args}}`, from the wire payload's
-	// separate `command`/`args` fields. Missing args decode as an empty object (commands without parameters).
-	let args = payload.args.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-	let mut tagged = serde_json::Map::new();
-	tagged.insert(payload.command.clone(), args);
-
-	let command: crate::EditorCommand = match serde_json::from_value(serde_json::Value::Object(tagged)) {
-		Ok(command) => command,
-		Err(error) => {
-			log::warn!("Remote control: rejecting undeserializable command {}: {error}", payload.command);
-			send_remote_error("bad_payload", &format!("unknown command or malformed args: {error}"), payload.request_id.as_deref());
-			return;
-		}
-	};
-
-	if let Err(error) = check_remote_command(&command) {
-		log::warn!("Remote control: rejecting invalid command {}: {error}", payload.command);
-		send_remote_error("invalid_command", &error, payload.request_id.as_deref());
-		return;
-	}
-
-	// The conversion is the validation boundary: `TryFrom` rejects payloads that deserialized but violate
-	// invariants (undefined modifier bits, wrong widget value shapes, out-of-range node ids)
-	match editor::messages::prelude::Message::try_from(command) {
-		Ok(message) => crate::helpers::wrapper(move |wrapper| wrapper.dispatch(message)),
-		Err(error) => {
-			log::warn!("Remote control: rejecting invalid command {}: {error}", payload.command);
-			send_remote_error("invalid_command", &error, payload.request_id.as_deref());
-		}
-	}
-}
-
-/// Remote-only checks on argument values the editor core trusts because the JS UI can only produce valid ones,
-/// but which panic (or, in release builds, hit undefined behavior) when a remote caller supplies them. Kept in this
-/// fork-owned module rather than in upstream's command bodies so the checks add no upstream diff and leave the JS
-/// path unchanged. Only stateless checks live here; stale-but-well-formed ids are a documented limit (see the host
-/// repo's `design-spec/remote-control/remote-input-audit.md`). A new upstream command gets no check until added here.
-fn check_remote_command(command: &crate::EditorCommand) -> Result<(), String> {
-	use crate::EditorCommand;
-
-	// `LayerNodeIdentifier` stores `id + 1` in a `NonZeroU64`: u64::MAX overflows, and 0 is the root parent
-	let layer_id = |id: u64| if id == 0 || id == u64::MAX { Err("layer id out of range".to_string()) } else { Ok(()) };
-	// The core adds per-layer offsets to the insert index without overflow checks (and `usize` is 32 bits on wasm)
-	let insert_index = |index: Option<usize>| match index {
-		Some(index) if index > i32::MAX as usize => Err("insert index out of range".to_string()),
-		_ => Ok(()),
-	};
-
-	match command {
-		EditorCommand::SelectLayer { id, .. } | EditorCommand::ClipLayer { id } | EditorCommand::SetLayerName { id, .. } => layer_id(*id),
-		EditorCommand::MoveLayerInTree { insert_index: index, .. } | EditorCommand::DuplicateLayerInTree { insert_index: index, .. } => insert_index(*index),
-		// `PanelType::from` panics on any other name
-		EditorCommand::SetActivePanel { panel } => match panel.as_str() {
-			"Welcome" | "Document" | "Layers" | "Properties" | "Data" => Ok(()),
-			_ => Err(format!("unknown panel {panel:?}")),
-		},
-		// `DefinitionIdentifier::from_serialized` panics without one of these prefixes
-		EditorCommand::CreateNode { node_type, .. } => match node_type.split_once(':') {
-			Some(("PROTONODE" | "NETWORK", _)) => Ok(()),
-			_ => Err("node type must start with PROTONODE: or NETWORK:".to_string()),
-		},
-		// The viewport handler asserts a positive scale
-		EditorCommand::UpdateViewport { scale, .. } => {
-			if scale.is_finite() && *scale > 0. {
-				Ok(())
-			} else {
-				Err("viewport scale must be finite and positive".to_string())
-			}
-		}
-		_ => Ok(()),
-	}
-}
-
-/// Broadcast a wire-format `RemoteError` pseudo-message update frame back through the socket.
-fn send_remote_error(code: &str, detail: &str, request_id: Option<&str>) {
-	let Some(uuid) = CONFIG.with_borrow(|config| config.as_ref().map(|config| config.uuid.clone())) else {
-		return;
-	};
-
-	let mut data = serde_json::Map::new();
-	data.insert("error".to_string(), code.into());
-	data.insert("detail".to_string(), detail.into());
-	if let Some(request_id) = request_id {
-		data.insert("request_id".to_string(), request_id.into());
-	}
-	let frame = serde_json::json!({
-		"v": PROTOCOL_VERSION,
-		"from_graphite_uuid": uuid,
-		"message": "RemoteError",
-		"data": data,
-	});
-
-	send_if_open(&frame.to_string(), "RemoteError frame");
-}
-
 /// Outbound tee, called from the single hook in `send_frontend_message_to_js` for every message on
 /// the JS callback path (`UpdateImageData` returns early before the hook and never arrives — intended,
-/// raster output is excluded from the wire). Forwards the v1 allowlist to the relay socket.
-///
-/// The allowlist is a compile-time-exhaustive match — no wildcard arm — so any upstream variant
-/// addition, rename, or removal fails the build here and forces a deliberate allowlist decision
-/// instead of a silent wire-protocol change. The allowlist itself is defined in the host repo's
-/// `design-spec/remote-control/wire-format.md`; keep the two in lockstep.
+/// raster output is excluded from the wire). Forwards the messages `remote_protocol`'s v1 allowlist
+/// passes to the relay socket. `WebSocket::send` never synchronously re-enters `dispatch()`.
 pub(crate) fn tee_frontend_message(message: &FrontendMessage) {
 	// Cheap early-out when remote control is inert, disconnected, or still connecting
 	if !SOCKET.with_borrow(|socket| socket.as_ref().is_some_and(|socket| socket.ready_state() == WebSocket::OPEN)) {
 		return;
 	}
-
-	#[rustfmt::skip]
-	let allowlisted = match message {
-		// ------ Allowlisted: observing document list, layer structure, selection, dialog, and tool state ------
-		FrontendMessage::UpdateOpenDocumentsList { .. }
-		| FrontendMessage::UpdateActiveDocument { .. }
-		| FrontendMessage::UpdateDocumentLayerStructure { .. }
-		| FrontendMessage::UpdateDocumentLayerDetails { .. }
-		| FrontendMessage::UpdateNodeGraphSelection { .. }
-		| FrontendMessage::DisplayDialog { .. }
-		| FrontendMessage::DialogClose
-		| FrontendMessage::DisplayDialogPanic { .. }
-		| FrontendMessage::UpdateLayout { .. } => true,
-
-		// ------ Dropped: bulk/continuous render output ------
-		FrontendMessage::UpdateDocumentArtwork { .. }
-		| FrontendMessage::UpdateImageData { .. }
-		| FrontendMessage::UpdateNodeThumbnail { .. }
-		| FrontendMessage::UpdateGraphFadeArtwork { .. }
-		// ------ Dropped: per-input-event chatter ------
-		| FrontendMessage::UpdateBox { .. }
-		| FrontendMessage::UpdateDocumentRulers { .. }
-		| FrontendMessage::UpdateDocumentScrollbars { .. }
-		| FrontendMessage::UpdateMouseCursor { .. }
-		| FrontendMessage::UpdateEyedropperSamplingState { .. }
-		| FrontendMessage::UpdateWirePathInProgress { .. }
-		| FrontendMessage::UpdateClickTargets { .. }
-		| FrontendMessage::UpdateLayerWidths { .. }
-		| FrontendMessage::UpdateImportReorderIndex { .. }
-		| FrontendMessage::UpdateExportReorderIndex { .. }
-		| FrontendMessage::UpdateGradientStopColorPickerPosition { .. }
-		| FrontendMessage::ColorPickerColorChanged { .. }
-		| FrontendMessage::ColorPickerStartHistoryTransaction
-		| FrontendMessage::ColorPickerCommitHistoryTransaction
-		// ------ Dropped: node-graph internals beyond selection ------
-		| FrontendMessage::UpdateNodeGraphNodes { .. }
-		| FrontendMessage::UpdateNodeGraphWires { .. }
-		| FrontendMessage::ClearAllNodeGraphWires
-		| FrontendMessage::UpdateVisibleNodes { .. }
-		| FrontendMessage::UpdateNodeGraphErrorDiagnostic { .. }
-		| FrontendMessage::UpdateNodeGraphTransform { .. }
-		| FrontendMessage::UpdateImportsExports { .. }
-		| FrontendMessage::UpdateInSelectedNetwork { .. }
-		| FrontendMessage::UpdateGraphViewOverlay { .. }
-		| FrontendMessage::UpdateContextMenuInformation { .. }
-		// ------ Dropped: ByteBuf payloads and document-content leak paths ------
-		| FrontendMessage::DisplayEditableTextbox { .. }
-		| FrontendMessage::DisplayEditableTextboxUpdateFontData { .. }
-		| FrontendMessage::TriggerSaveDocument { .. }
-		| FrontendMessage::TriggerSaveFile { .. }
-		// ------ Dropped: host-capability triggers answered by the human's browser ------
-		| FrontendMessage::DisplayEditableTextboxTransform { .. }
-		| FrontendMessage::DisplayRemoveEditableTextbox
-		| FrontendMessage::SendUIMetadata { .. }
-		| FrontendMessage::SendShortcutFullscreen { .. }
-		| FrontendMessage::SendShortcutAltClick { .. }
-		| FrontendMessage::SendShortcutShiftClick { .. }
-		| FrontendMessage::TriggerAboutGraphiteLocalizedCommitDate { .. }
-		| FrontendMessage::TriggerDisplayThirdPartyLicensesDialog
-		| FrontendMessage::TriggerBrowse { .. }
-		| FrontendMessage::TriggerExportImage { .. }
-		| FrontendMessage::TriggerFetchAndOpenDocument { .. }
-		| FrontendMessage::TriggerPersistenceReadState
-		| FrontendMessage::TriggerPersistenceWriteState { .. }
-		| FrontendMessage::TriggerOpenLaunchDocuments
-		| FrontendMessage::TriggerLoadPreferences
-		| FrontendMessage::TriggerSavePreferences { .. }
-		| FrontendMessage::TriggerTextCommit
-		| FrontendMessage::TriggerEditLayerNameInGraph { .. }
-		| FrontendMessage::TriggerVisitLink { .. }
-		| FrontendMessage::TriggerClipboardRead
-		| FrontendMessage::TriggerClipboardWrite { .. }
-		| FrontendMessage::TriggerSelectionRead { .. }
-		| FrontendMessage::TriggerSelectionWrite { .. }
-		// ------ Dropped: window/platform chrome ------
-		| FrontendMessage::UpdateWorkspacePanelLayout { .. }
-		| FrontendMessage::UpdatePlatform { .. }
-		| FrontendMessage::UpdateMaximized { .. }
-		| FrontendMessage::UpdateFullscreen { .. }
-		| FrontendMessage::UpdateViewportHolePunch { .. }
-		| FrontendMessage::UpdateUIScale { .. }
-		| FrontendMessage::WindowPointerLockMove { .. }
-		| FrontendMessage::WindowFullscreen => false,
-	};
-
-	if allowlisted {
-		send_update_frame(message);
-	}
-}
-
-/// Serialize an allowlisted message independently of the JS path (which uses `serde_wasm_bindgen`)
-/// and send it as a wire-format Graphite update frame. `WebSocket::send` never synchronously
-/// re-enters `dispatch()`.
-fn send_update_frame(message: &FrontendMessage) {
 	let Some(uuid) = CONFIG.with_borrow(|config| config.as_ref().map(|config| config.uuid.clone())) else {
 		return;
 	};
 
-	// serde's externally-tagged encoding is `{"VariantName": {fields}}` for struct variants and
-	// `"VariantName"` for unit variants; the wire frame carries the fields object alone as `data`
-	let data = match serde_json::to_value(message) {
-		Ok(serde_json::Value::Object(map)) => map.into_values().next().unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
-		Ok(_) => serde_json::Value::Object(serde_json::Map::new()),
-		Err(error) => {
-			log::warn!("Remote control: failed to serialize FrontendMessage for the socket: {error}");
-			return;
-		}
-	};
-
-	let frame = serde_json::json!({
-		"v": PROTOCOL_VERSION,
-		"from_graphite_uuid": uuid,
-		"message": message.to_discriminant().local_name(),
-		"data": data,
-	});
-
-	send_if_open(&frame.to_string(), "update frame");
+	for frame in remote_protocol::encode_updates(std::slice::from_ref(message), &uuid) {
+		send_if_open(&frame, "update frame");
+	}
 }
 
 /// Send a text frame if the socket is open. An absent, still-connecting, or closing socket drops the frame silently:

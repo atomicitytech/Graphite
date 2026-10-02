@@ -10,6 +10,9 @@ pub mod helpers;
 pub mod native_communication;
 #[cfg(all(not(feature = "native"), target_family = "wasm"))]
 mod remote_communication;
+// Remote-control fork: platform-neutral protocol shared by the web client and the desktop relay client
+#[cfg(feature = "editor")]
+pub mod remote_protocol;
 mod wasm_value;
 
 // Remote-control fork: cfg gate removed (upstream: `any(feature = "native", not(target_family = "wasm"))`)

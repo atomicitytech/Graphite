@@ -415,7 +415,9 @@ impl App {
 	}
 
 	fn dispatch_desktop_wrapper_message(&mut self, message: DesktopWrapperMessage) {
-		let responses = self.desktop_wrapper.dispatch(message);
+		let mut responses = self.desktop_wrapper.dispatch(message);
+		// Remote-control fork: relay client lazy start and outbound tee
+		crate::relay_client::on_responses(&self.app_event_scheduler, &mut responses);
 		self.handle_desktop_frontend_messages(responses);
 	}
 

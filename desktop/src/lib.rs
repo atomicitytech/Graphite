@@ -20,6 +20,8 @@ mod gpu_context;
 mod input;
 mod persist;
 mod preferences;
+// Remote-control fork: native relay client (desktop counterpart of the web build's remote_communication.rs)
+mod relay_client;
 mod render;
 mod socket;
 mod window;
@@ -70,6 +72,9 @@ pub fn start() -> ExitCode {
 			return ExitCode::SUCCESS;
 		}
 	};
+
+	// Remote-control fork: hand the relay flags to the relay client before anything can start it
+	relay_client::configure(cli.tcp_relay.clone(), cli.tcp_secret.clone());
 
 	dirs::clear_dir(&ui::temp_dir_root());
 
@@ -144,6 +149,9 @@ pub fn start() -> ExitCode {
 
 	let exit_reason = app.run(event_loop);
 
+	// Remote-control fork: stop the relay client (non-blocking) so it never reconnects once exit has begun
+	relay_client::shutdown();
+
 	// ui needs to be shutdown before restarting
 	ui.shutdown();
 
@@ -162,6 +170,8 @@ pub fn start() -> ExitCode {
 		app::ExitReason::Restart | app::ExitReason::UiAccelerationFailure => {
 			tracing::info!("Restarting application");
 			let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+			// Remote-control fork: carry the relay flags over to the restarted process
+			command.args(relay_client::restart_args());
 			#[cfg(target_family = "unix")]
 			let _ = std::os::unix::process::CommandExt::exec(&mut command);
 			#[cfg(target_family = "unix")]

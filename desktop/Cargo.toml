@@ -29,6 +29,10 @@ accelerated_paint = ["graphite-desktop-ui/accelerated_paint"]
 # Local dependencies
 graphite-desktop-wrapper = { path = "wrapper" }
 graphite-desktop-ui = { path = "ui" }
+# Remote-control fork: shared remote protocol (allowlist and frame encoding) for the desktop relay client
+graphite-wasm-wrapper = { path = "../frontend/wrapper", default-features = false, features = [
+	"editor",
+] }
 
 wgpu = { workspace = true }
 winit = { workspace = true, features = [
@@ -56,6 +60,12 @@ clap = { workspace = true, features = ["derive"] }
 interprocess = "2.4.2"
 fd-lock = "4.0.4"
 ctrlc = "3.5.1"
+# Remote-control fork: WebSocket transport for the native relay client (relay_client.rs)
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+
+# Remote-control fork: relay client tests build and inspect JSON frames
+[dev-dependencies]
+serde_json = { workspace = true }
 
 # Windows-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
